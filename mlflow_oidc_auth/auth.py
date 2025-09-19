@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, List, Optional, Union, Any
 
 import requests
 from authlib.integrations.flask_client import OAuth
@@ -129,11 +129,40 @@ def handle_token_validation(oauth_instance: OAuth):
     return token
 
 
-def handle_user_and_group_management(token) -> list[str]:
-    """Handle user and group management based on the token. Returns list of error messages or empty list."""
-    errors = []
-    email = token["userinfo"].get("email") or token["userinfo"].get("preferred_username")
-    display_name = token["userinfo"].get("name")
+def handle_user_and_group_management(token: Union[Dict[str, Any], Any]) -> List[str]:
+    """
+    Handle user and group management based on the OIDC token.
+
+    This function safely extracts user information from the token, validates required fields,
+    retrieves user groups, and manages user accounts and permissions in the system.
+
+    Parameters:
+        token (Union[Dict[str, Any], Any]): The OIDC token containing user information.
+                                           Can be a dictionary or an object with userinfo attribute.
+
+    Returns:
+        List[str]: List of error messages. Empty list indicates success.
+
+    Note:
+        This function handles the edge case where userinfo might be missing from the token,
+        which was causing KeyError exceptions in previous versions.
+    """
+    errors: List[str] = []
+
+    # Safely access userinfo from token (handles both dict and object tokens)
+    # This approach prevents KeyError when userinfo is missing
+    userinfo: Optional[Dict[str, Any]] = getattr(token, "userinfo", None)
+    if userinfo is None and isinstance(token, dict):
+        userinfo = token.get("userinfo")
+    if not isinstance(userinfo, dict):
+        errors.append("OIDC token error: 'userinfo' is missing or not a dictionary.")
+        return errors
+
+    # Extract required user profile information
+    email: Optional[str] = userinfo.get("email") or userinfo.get("preferred_username")
+    display_name: Optional[str] = userinfo.get("name")
+
+    # Validate required profile fields
     if not email:
         errors.append("User profile error: No email provided in OIDC userinfo.")
     if not display_name:
@@ -141,14 +170,14 @@ def handle_user_and_group_management(token) -> list[str]:
     if errors:
         return errors
 
-    # Get user groups
+    # Get user groups from either plugin or userinfo
     try:
         if config.OIDC_GROUP_DETECTION_PLUGIN:
             import importlib
 
             user_groups = importlib.import_module(config.OIDC_GROUP_DETECTION_PLUGIN).get_user_groups(token["access_token"])
         else:
-            user_groups = token["userinfo"][config.OIDC_GROUPS_ATTRIBUTE]
+            user_groups = userinfo[config.OIDC_GROUPS_ATTRIBUTE]
     except Exception as e:
         logger.error(f"Group detection error: {str(e)}")
         errors.append("Group detection error: Failed to get user groups")
@@ -172,14 +201,30 @@ def handle_user_and_group_management(token) -> list[str]:
     return errors
 
 
-def process_oidc_callback(request, session) -> tuple[Optional[str], list[str]]:
+def process_oidc_callback(request, session) -> tuple[Optional[str], List[str]]:
     """
-    Process the OIDC callback logic.
-    Returns (email, error_list) tuple.
+    Process the OIDC authentication callback request.
+
+    This function handles the complete OIDC callback flow including state validation,
+    token retrieval, userinfo validation, and user management. It ensures proper error
+    handling for edge cases like missing userinfo in tokens.
+
+    Parameters:
+        request: Flask request object containing callback parameters
+        session: Flask session object containing OAuth state
+
+    Returns:
+        tuple[Optional[str], List[str]]: A tuple containing:
+            - email (str or None): User's email address if authentication succeeds, None on error
+            - errors (List[str]): List of error messages, empty if successful
+
+    Note:
+        This function now validates userinfo presence before calling user management
+        functions to prevent KeyError exceptions that occurred in previous versions.
     """
     import html
 
-    errors = []
+    errors: List[str] = []
 
     # Handle OIDC error response
     error_param = request.args.get("error")
@@ -211,20 +256,21 @@ def process_oidc_callback(request, session) -> tuple[Optional[str], list[str]]:
         errors.append("OIDC token error: Invalid token signature or token could not be validated.")
         return None, errors
 
-    # User and group management
-    user_errors = handle_user_and_group_management(token)
-    if user_errors:
-        errors.extend(user_errors)
-        return None, errors
-
-    userinfo = getattr(token, "userinfo", None)
+    # Validate userinfo presence and structure before calling user management
+    # This prevents KeyError: 'userinfo' that occurred when tokens lacked userinfo
+    userinfo: Optional[Dict[str, Any]] = getattr(token, "userinfo", None)
     if userinfo is None and isinstance(token, dict):
         userinfo = token.get("userinfo")
     if not isinstance(userinfo, dict):
         errors.append("OIDC token error: 'userinfo' is missing or not a dictionary.")
         return None, errors
-    email = userinfo.get("email") or userinfo.get("preferred_username")
-    if email is None:
-        errors.append("OIDC token error: 'email' is missing in userinfo.")
+
+    # User and group management (now safe to call since userinfo is validated)
+    user_errors: List[str] = handle_user_and_group_management(token)
+    if user_errors:
+        errors.extend(user_errors)
         return None, errors
+
+    # Extract email for return value (userinfo already validated above)
+    email: str = userinfo.get("email") or userinfo.get("preferred_username")
     return email.lower(), []
